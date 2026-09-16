@@ -391,7 +391,7 @@ http {
 // TODO(@matej-g): This is a temporary workaround for https://github.com/efficientgo/e2e/issues/11;
 // after this is addresses fixed all calls should be replaced with e2edb.NewMinio.
 func NewMinio(e e2e.Environment, name, bktName string) *e2emon.InstrumentedRunnable {
-	image := "minio/minio:RELEASE.2022-07-30T05-21-40Z"
+	image := "quay.io/minio/minio:RELEASE.2022-07-30T05-21-40Z"
 
 	httpsPort := 8090
 	consolePort := 8080
