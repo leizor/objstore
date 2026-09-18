@@ -959,14 +959,55 @@ type timingReader struct {
 
 	alreadyGotErr bool
 
-	start             time.Time
-	op                string
-	readBytes         int64
+	start         time.Time
+	op            string
+	readBytes     int64
+	readAtTracker *readAtTracker
+
 	duration          *prometheus.HistogramVec
 	failed            *prometheus.CounterVec
 	isFailureExpected IsOpFailureExpectedFunc
 	fetchedBytes      *prometheus.CounterVec
 	transferredBytes  *prometheus.HistogramVec
+}
+
+type readAtTracker struct {
+	offsetResults map[int64]readAtOffsetResult
+	mtx           sync.Mutex
+	isRealFailure func(error) bool
+}
+
+func newReadAtTracker(isRealFailure func(error) bool) *readAtTracker {
+	return &readAtTracker{
+		offsetResults: make(map[int64]readAtOffsetResult),
+		mtx:           sync.Mutex{},
+		isRealFailure: isRealFailure,
+	}
+}
+
+func (t *readAtTracker) updateMetrics(off int64, n int, err error) {
+	t.mtx.Lock()
+	defer t.mtx.Unlock()
+	t.offsetResults[off] = readAtOffsetResult{n: n, err: err}
+}
+
+func (t *readAtTracker) close() (readBytes int64, anyErr bool) {
+	t.mtx.Lock()
+	defer t.mtx.Unlock()
+
+	for _, res := range t.offsetResults {
+		readBytes += int64(res.n)
+		if t.isRealFailure(res.err) {
+			anyErr = true
+		}
+	}
+
+	return readBytes, anyErr
+}
+
+type readAtOffsetResult struct {
+	n   int
+	err error
 }
 
 func newTimingReader(start time.Time, r io.Reader, closeReader bool, op string, dur *prometheus.HistogramVec, failed *prometheus.CounterVec, isFailureExpected IsOpFailureExpectedFunc, fetchedBytes *prometheus.CounterVec, transferredBytes *prometheus.HistogramVec) io.ReadCloser {
@@ -989,6 +1030,8 @@ func newTimingReader(start time.Time, r io.Reader, closeReader bool, op string, 
 		transferredBytes:  transferredBytes,
 		readBytes:         0,
 	}
+
+	trc.readAtTracker = newReadAtTracker(trc.isRealFailure)
 
 	_, isSeeker := r.(io.Seeker)
 	_, isReaderAt := r.(io.ReaderAt)
@@ -1024,14 +1067,22 @@ func (r *timingReader) Close() error {
 		}
 	}
 
-	// Track duration and transferred bytes only if no error occurred.
-	if !r.alreadyGotErr {
-		r.duration.WithLabelValues(r.op).Observe(time.Since(r.start).Seconds())
-		r.transferredBytes.WithLabelValues(r.op).Observe(float64(r.readBytes))
-
-		// Trick to tracking metrics multiple times in case Close() gets called again.
-		r.alreadyGotErr = true
+	if r.alreadyGotErr {
+		return closeErr
 	}
+
+	// Track duration and transferred bytes only if no error occurred.
+	readAtBytes, readAtAnyErr := r.readAtTracker.close()
+	if readAtAnyErr {
+		r.failed.WithLabelValues(r.op).Inc()
+		return closeErr
+	}
+
+	r.duration.WithLabelValues(r.op).Observe(time.Since(r.start).Seconds())
+	r.transferredBytes.WithLabelValues(r.op).Observe(float64(r.readBytes + readAtBytes))
+
+	// Trick to tracking metrics multiple times in case Close() gets called again.
+	r.alreadyGotErr = true
 
 	return closeErr
 }
@@ -1049,12 +1100,14 @@ func (r *timingReader) updateMetrics(n int, err error) {
 	r.readBytes += int64(n)
 
 	// Report metric just once.
-	if !r.alreadyGotErr && err != nil && err != io.EOF {
-		if !r.isFailureExpected(err) && !errors.Is(err, context.Canceled) {
-			r.failed.WithLabelValues(r.op).Inc()
-		}
+	if !r.alreadyGotErr && r.isRealFailure(err) {
+		r.failed.WithLabelValues(r.op).Inc()
 		r.alreadyGotErr = true
 	}
+}
+
+func (r *timingReader) isRealFailure(err error) bool {
+	return err != nil && err != io.EOF && !r.isFailureExpected(err) && !errors.Is(err, context.Canceled)
 }
 
 type timingReaderSeeker struct {
@@ -1070,7 +1123,12 @@ type timingReaderSeekerReaderAt struct {
 }
 
 func (rsc *timingReaderSeekerReaderAt) ReadAt(p []byte, off int64) (int, error) {
-	return (rsc.Reader).(io.ReaderAt).ReadAt(p, off)
+	n, err := (rsc.Reader).(io.ReaderAt).ReadAt(p, off)
+	rsc.readAtTracker.updateMetrics(off, n, err)
+	if rsc.fetchedBytes != nil {
+		rsc.fetchedBytes.WithLabelValues(rsc.op).Add(float64(n))
+	}
+	return n, err
 }
 
 type timingReaderWriterTo struct {
